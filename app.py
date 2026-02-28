@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-YouTube Music Video Uploader
+Music Video + Metadata Generator
 Genera un video desde 2 fotos + 1 audio WAV, hace OCR del texto en las fotos,
-genera descripción y sube automáticamente a YouTube usando Chrome logueado.
+genera título/descripción/hashtags para subir manualmente a YouTube.
 """
 
 import tkinter as tk
@@ -12,6 +12,10 @@ import os
 import sys
 import subprocess
 import time
+import shutil
+import json
+import urllib.request
+import urllib.error
 
 # ──────────────────────────────────────────────
 # Instalación automática de dependencias
@@ -20,8 +24,6 @@ REQUIRED_PACKAGES = [
     ("Pillow", "PIL"),
     ("pytesseract", "pytesseract"),
     ("moviepy", "moviepy"),
-    ("selenium", "selenium"),
-    ("webdriver_manager", "webdriver_manager"),
     ("numpy", "numpy"),
     ("opencv-python", "cv2"),
 ]
@@ -49,20 +51,53 @@ import pytesseract
 import numpy as np
 
 # moviepy
-try:
-    from moviepy.editor import ImageClip, AudioFileClip, CompositeVideoClip, concatenate_videoclips
-except ImportError:
-    from moviepy import ImageClip, AudioFileClip, CompositeVideoClip, concatenate_videoclips
+import importlib
+moviepy_module = importlib.import_module("moviepy")
+if hasattr(moviepy_module, "ImageClip") and hasattr(moviepy_module, "AudioFileClip"):
+    ImageClip = moviepy_module.ImageClip
+    AudioFileClip = moviepy_module.AudioFileClip
+else:
+    editor_module = importlib.import_module("moviepy.editor")
+    ImageClip = editor_module.ImageClip
+    AudioFileClip = editor_module.AudioFileClip
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.keys import Keys
-from webdriver_manager.chrome import ChromeDriverManager
 import cv2
+
+
+def configure_tesseract() -> bool:
+    """Configura la ruta de Tesseract si está disponible en PATH o en rutas comunes."""
+    custom_cmd = os.environ.get("TESSERACT_CMD")
+    if custom_cmd and os.path.exists(custom_cmd):
+        pytesseract.pytesseract.tesseract_cmd = custom_cmd
+        return True
+
+    path_cmd = shutil.which("tesseract")
+    if path_cmd:
+        pytesseract.pytesseract.tesseract_cmd = path_cmd
+        return True
+
+    windows_candidates = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.join(os.path.expanduser("~"), r"AppData\Local\Programs\Tesseract-OCR\tesseract.exe"),
+    ]
+    for candidate in windows_candidates:
+        if os.path.exists(candidate):
+            pytesseract.pytesseract.tesseract_cmd = candidate
+            return True
+
+    return False
+
+
+def tesseract_help_message() -> str:
+    return (
+        "No se encontró Tesseract OCR instalado.\n\n"
+        "1) Instalalo desde: https://github.com/UB-Mannheim/tesseract/wiki\n"
+        "2) Reiniciá la app.\n"
+        "3) Si sigue fallando, agregá tesseract.exe al PATH o definí la variable TESSERACT_CMD.\n\n"
+        "Ruta típica en Windows:\n"
+        "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+    )
 
 
 # ══════════════════════════════════════════════
@@ -79,24 +114,80 @@ class MusicVideoProcessor:
         self.progress = progress_callback or (lambda v, t: None)
         self.log = log_callback or print
 
+    def _apply_fps(self, clip, fps: int):
+        if hasattr(clip, "with_fps"):
+            return clip.with_fps(fps)
+        if hasattr(clip, "set_fps"):
+            return clip.set_fps(fps)
+        setattr(clip, "fps", fps)
+        return clip
+
+    def _apply_audio(self, clip, audio_clip):
+        if hasattr(clip, "with_audio"):
+            return clip.with_audio(audio_clip)
+        if hasattr(clip, "set_audio"):
+            return clip.set_audio(audio_clip)
+        setattr(clip, "audio", audio_clip)
+        return clip
+
     # ── OCR ──────────────────────────────────
     def extract_text_from_image(self, image_path: str) -> str:
         self.log(f"🔍 Extrayendo texto de: {os.path.basename(image_path)}")
+        if not configure_tesseract():
+            raise RuntimeError(tesseract_help_message())
+
         img = Image.open(image_path)
         # Preprocesado para mejorar OCR
         img_gray = img.convert("L")
         img_sharp = img_gray.filter(ImageFilter.SHARPEN)
-        text = pytesseract.image_to_string(img_sharp, lang="spa+eng")
+        try:
+            text = pytesseract.image_to_string(img_sharp, lang="spa+eng")
+        except pytesseract.TesseractNotFoundError as exc:
+            raise RuntimeError(tesseract_help_message()) from exc
         return text.strip()
 
     # ── Descripción para YouTube ──────────────
     def generate_description(self, text1: str, text2: str) -> dict:
-        """Parsea el texto OCR y genera título + descripción + hashtags."""
+        """Parsea OCR y genera título Full Album + descripción + hashtags."""
         combined = f"{text1}\n\n{text2}"
         lines = [l.strip() for l in combined.splitlines() if l.strip()]
 
-        # Intenta extraer info común de tracklists
-        title_line = lines[0] if lines else "Música"
+        album = "Álbum"
+        artist = "Artista"
+
+        cleaned = []
+        for line in lines:
+            normalized = " ".join(line.replace("|", " ").split())
+            if normalized:
+                cleaned.append(normalized)
+
+        for index, line in enumerate(cleaned[:12]):
+            upper = line.upper()
+            if "RETRATO DE" in upper or "ALBUM" in upper or "ÁLBUM" in upper:
+                album = line.title()
+                if index + 1 < len(cleaned):
+                    candidate_artist = cleaned[index + 1]
+                    if len(candidate_artist.split()) >= 2 and not candidate_artist[:1].isdigit():
+                        artist = candidate_artist.title()
+                break
+
+        if album == "Álbum":
+            for line in cleaned:
+                if line[:1].isdigit():
+                    continue
+                if len(line.split()) >= 2:
+                    album = line.title()
+                    break
+
+        if artist == "Artista":
+            for line in cleaned:
+                if line[:1].isdigit():
+                    continue
+                if len(line.split()) >= 2 and line.title() != album:
+                    artist = line.title()
+                    break
+
+        title_line = f"Full Album - {album} - {artist}"[:100]
         
         # Hashtags automáticos desde palabras clave del texto
         keywords = set()
@@ -134,6 +225,102 @@ class MusicVideoProcessor:
             "tags": [t.lstrip("#") for t in all_tags]
         }
 
+    def save_metadata_file(self, output_path: str, metadata: dict) -> str:
+        metadata_path = os.path.splitext(output_path)[0] + "_metadata.txt"
+        hashtags_line = " ".join(f"#{tag}" for tag in metadata.get("tags", []))
+        content = (
+            "TITULO:\n"
+            f"{metadata.get('title', '')}\n\n"
+            "DESCRIPCION:\n"
+            f"{metadata.get('description', '')}\n\n"
+            "HASHTAGS:\n"
+            f"{hashtags_line}\n"
+        )
+        with open(metadata_path, "w", encoding="utf-8") as file:
+            file.write(content)
+        self.log(f"📝 Metadata guardada: {metadata_path}")
+        return metadata_path
+
+    def improve_metadata_with_ai(self, metadata: dict) -> dict:
+        """Corrige ortografía/estilo usando IA online (API compatible con OpenAI)."""
+        api_key = os.environ.get("AI_API_KEY", "").strip()
+        if not api_key:
+            self.log("ℹ️ IA: AI_API_KEY no configurada. Se mantiene metadata original.")
+            return metadata
+
+        api_base = os.environ.get("AI_API_BASE", "https://api.openai.com/v1").rstrip("/")
+        model = os.environ.get("AI_MODEL", "gpt-4o-mini")
+        endpoint = f"{api_base}/chat/completions"
+
+        prompt = {
+            "title": metadata.get("title", ""),
+            "description": metadata.get("description", ""),
+            "tags": metadata.get("tags", []),
+        }
+
+        payload = {
+            "model": model,
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Corregí ortografía y puntuación en español sin cambiar el sentido. "
+                        "Mantené el formato del título: Full Album - <Álbum> - <Artista>. "
+                        "No inventes datos. Devolvé SOLO JSON con claves: title, description, tags."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(prompt, ensure_ascii=False)
+                }
+            ]
+        }
+
+        request_data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            endpoint,
+            data=request_data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST"
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                raw = response.read().decode("utf-8", errors="ignore")
+            data = json.loads(raw)
+            content = data["choices"][0]["message"]["content"]
+            fixed = json.loads(content) if isinstance(content, str) else content
+
+            title = str(fixed.get("title", metadata.get("title", ""))).strip()[:100]
+            description = str(fixed.get("description", metadata.get("description", ""))).strip()
+            tags_in = fixed.get("tags", metadata.get("tags", []))
+            if not isinstance(tags_in, list):
+                tags_in = metadata.get("tags", [])
+
+            tags = []
+            for tag in tags_in:
+                normalized = str(tag).replace("#", "").strip().lower()
+                if normalized and normalized not in tags:
+                    tags.append(normalized)
+
+            if not title.startswith("Full Album -"):
+                title = metadata.get("title", title)
+
+            self.log("✨ Metadata corregida con IA.")
+            return {
+                "title": title,
+                "description": description,
+                "tags": tags or metadata.get("tags", [])
+            }
+        except Exception as exc:
+            self.log(f"⚠️ IA no disponible ({exc}). Se usa metadata original.")
+            return metadata
+
     # ── Preparar frame de imagen ──────────────
     def _prepare_half_frame(self, image_path: str, side: str) -> np.ndarray:
         """Redimensiona imagen para ocupar mitad del frame 1920x1080."""
@@ -160,8 +347,8 @@ class MusicVideoProcessor:
 
         self.progress(50, "Generando clip de video...")
         video_clip = ImageClip(combined, duration=duration)
-        video_clip = video_clip.set_fps(24)
-        video_clip = video_clip.set_audio(audio)
+        video_clip = self._apply_fps(video_clip, 24)
+        video_clip = self._apply_audio(video_clip, audio)
 
         self.progress(60, "Exportando video (puede tardar unos minutos)...")
         video_clip.write_videofile(
@@ -177,134 +364,6 @@ class MusicVideoProcessor:
         self.log(f"✅ Video guardado: {output_path}")
         return output_path
 
-    # ── Subir a YouTube via Selenium ──────────
-    def upload_to_youtube(self, video_path: str, metadata: dict):
-        self.log("🌐 Conectando con Chrome...")
-        self.progress(75, "Conectando con Chrome...")
-
-        # Conectar al Chrome ya abierto (debug port)
-        chrome_options = Options()
-        chrome_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
-        
-        try:
-            driver = webdriver.Chrome(
-                service=Service(ChromeDriverManager().install()),
-                options=chrome_options
-            )
-        except Exception as e:
-            self.log(f"⚠️ No se pudo conectar al Chrome existente: {e}")
-            self.log("Abriendo nuevo Chrome...")
-            chrome_options = Options()
-            chrome_options.add_argument("--start-maximized")
-            driver = webdriver.Chrome(
-                service=Service(ChromeDriverManager().install()),
-                options=chrome_options
-            )
-
-        wait = WebDriverWait(driver, 30)
-
-        try:
-            self.log("📤 Navegando a YouTube Studio...")
-            self.progress(78, "Abriendo YouTube Studio...")
-            driver.get("https://studio.youtube.com")
-            time.sleep(3)
-
-            # Click en "Crear" > "Subir videos"
-            self.log("🖱️ Buscando botón de subida...")
-            self.progress(80, "Iniciando subida...")
-
-            # Botón CREATE
-            create_btn = wait.until(EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, "#create-icon, ytcp-button#create-icon, [test-id='create-icon']")
-            ))
-            create_btn.click()
-            time.sleep(1)
-
-            # Opción "Subir video"
-            upload_option = wait.until(EC.element_to_be_clickable(
-                (By.XPATH, "//*[contains(text(),'Subir') or contains(text(),'Upload')]")
-            ))
-            upload_option.click()
-            time.sleep(2)
-
-            # Input de archivo
-            file_input = wait.until(EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "input[type='file']")
-            ))
-            file_input.send_keys(os.path.abspath(video_path))
-            self.log("📁 Archivo enviado, esperando procesamiento...")
-            self.progress(83, "Subiendo archivo...")
-            time.sleep(5)
-
-            # Título
-            self.log("✏️ Completando título...")
-            title_field = wait.until(EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "#title-textarea #textbox, ytcp-social-suggestion-input #textbox")
-            ))
-            title_field.clear()
-            title_field.send_keys(Keys.CONTROL + "a")
-            title_field.send_keys(metadata["title"])
-            self.progress(86, "Completando título...")
-
-            # Descripción
-            self.log("📝 Completando descripción...")
-            desc_field = driver.find_element(
-                By.CSS_SELECTOR, "#description-textarea #textbox"
-            )
-            desc_field.click()
-            desc_field.send_keys(Keys.CONTROL + "a")
-            desc_field.send_keys(metadata["description"])
-            self.progress(89, "Completando descripción...")
-            time.sleep(1)
-
-            # No es para niños
-            try:
-                not_for_kids = driver.find_element(
-                    By.CSS_SELECTOR, "#radioLabel [name='made_for_kids'] + label, #not-made-for-kids"
-                )
-                not_for_kids.click()
-            except:
-                pass
-
-            # Siguiente x3
-            for i in range(3):
-                self.log(f"➡️ Paso {i+2}/4...")
-                self.progress(90 + i, f"Paso {i+2} de 4...")
-                next_btn = wait.until(EC.element_to_be_clickable(
-                    (By.CSS_SELECTOR, "#next-button, ytcp-button#next-button")
-                ))
-                next_btn.click()
-                time.sleep(2)
-
-            # Público
-            self.log("🌍 Configurando visibilidad: Público...")
-            public_radio = wait.until(EC.element_to_be_clickable(
-                (By.XPATH, "//*[@name='PUBLIC' or @value='PUBLIC']//ancestor::ytcp-paper-radio-button | //*[contains(@class,'public')][@role='radio']")
-            ))
-            public_radio.click()
-            time.sleep(1)
-
-            # Publicar
-            self.log("🚀 Publicando video...")
-            self.progress(97, "Publicando...")
-            publish_btn = wait.until(EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, "#done-button, ytcp-button#done-button")
-            ))
-            publish_btn.click()
-            time.sleep(5)
-
-            self.log("🎉 ¡Video subido exitosamente a YouTube!")
-            self.progress(100, "¡Listo!")
-
-        except Exception as e:
-            self.log(f"❌ Error en Selenium: {e}")
-            self.log("💡 Tip: Asegurate de que Chrome esté abierto con --remote-debugging-port=9222")
-            raise
-        finally:
-            # No cerramos Chrome para no cerrar la sesión del usuario
-            pass
-
-
 # ══════════════════════════════════════════════
 # INTERFAZ GRÁFICA
 # ══════════════════════════════════════════════
@@ -312,7 +371,7 @@ class MusicVideoProcessor:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("🎵 YouTube Music Video Uploader")
+        self.title("🎵 Full Album Video Generator")
         self.geometry("780x700")
         self.resizable(False, False)
         self.configure(bg="#1a1a2e")
@@ -321,6 +380,7 @@ class App(tk.Tk):
         self.img1_path = tk.StringVar()
         self.img2_path = tk.StringVar()
         self.output_path = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "output_video.mp4"))
+        self.last_metadata_path = ""
 
         self._build_ui()
 
@@ -332,15 +392,18 @@ class App(tk.Tk):
         TEXT = "#eaeaea"
         MUTED = "#a0a0b0"
         BTN_BG = "#0f3460"
+        READY_BG = ACCENT
+        DISABLED_BG = CARD
 
         style = ttk.Style(self)
         style.theme_use("clam")
+        self.last_metadata = None
         style.configure("TProgressbar", troughcolor=CARD, background=ACCENT, thickness=18)
 
         # ── Header ──
         header = tk.Frame(self, bg=ACCENT, height=60)
         header.pack(fill="x")
-        tk.Label(header, text="🎵  YouTube Music Video Uploader",
+        tk.Label(header, text="🎵  Full Album Video Generator",
                  font=("Segoe UI", 16, "bold"), bg=ACCENT, fg="white").pack(pady=15)
 
         main = tk.Frame(self, bg=DARK, padx=20, pady=10)
@@ -379,18 +442,13 @@ class App(tk.Tk):
         file_row(main, "Guardar como:", self.output_path,
                  [("MP4 video", "*.mp4")], is_save=True)
 
-        # Info Chrome
         info_frame = tk.Frame(main, bg="#0f3460", pady=8, padx=12)
         info_frame.pack(fill="x", pady=(14, 2))
         tk.Label(info_frame,
-                 text="ℹ️  Para subir automáticamente, iniciá Chrome con depuración remota:\n"
-                      "   chrome.exe --remote-debugging-port=9222",
+                 text="ℹ️  La app genera video + metadata para subir manualmente a YouTube.\n"
+                      "   Se crea un archivo *_metadata.txt con título, descripción y hashtags.",
                  font=("Consolas", 8), bg="#0f3460", fg="#90caf9",
                  justify="left").pack(anchor="w")
-        tk.Button(info_frame, text="📋 Copiar comando",
-                  command=self._copy_chrome_cmd,
-                  bg=BTN_BG, fg=TEXT, relief="flat", font=("Segoe UI", 8),
-                  padx=6, cursor="hand2").pack(anchor="e")
 
         # Barra de progreso
         section_label(main, "⚙️  Progreso")
@@ -416,18 +474,33 @@ class App(tk.Tk):
         btn_frame.pack(pady=12)
 
         self.btn_only_video = tk.Button(btn_frame, text="🎬  Solo generar video",
-                                         command=lambda: self._start(upload=False),
+                                         command=self._start,
                                          bg=BTN_BG, fg=TEXT, relief="flat",
                                          font=("Segoe UI", 10, "bold"),
                                          padx=16, pady=8, cursor="hand2")
         self.btn_only_video.pack(side="left", padx=8)
 
-        self.btn_full = tk.Button(btn_frame, text="🚀  Generar y subir a YouTube",
-                                   command=lambda: self._start(upload=True),
-                                   bg=ACCENT, fg="white", relief="flat",
-                                   font=("Segoe UI", 10, "bold"),
-                                   padx=16, pady=8, cursor="hand2")
-        self.btn_full.pack(side="left", padx=8)
+        self.btn_copy_title = tk.Button(btn_frame, text="📋 Copiar título",
+                        command=self._copy_title,
+                        bg=BTN_BG, fg=TEXT, relief="flat",
+                        font=("Segoe UI", 10, "bold"),
+                        padx=16, pady=8, cursor="hand2",
+                        state="disabled")
+        self.btn_copy_title.pack(side="left", padx=8)
+
+        self.btn_copy_description = tk.Button(btn_frame, text="📋 Copiar descripción",
+                              command=self._copy_description,
+                              bg=BTN_BG, fg=TEXT, relief="flat",
+                              font=("Segoe UI", 10, "bold"),
+                              padx=16, pady=8, cursor="hand2",
+                              state="disabled")
+        self.btn_copy_description.pack(side="left", padx=8)
+
+        self.copy_btn_default_bg = BTN_BG
+        self.copy_btn_ready_bg = READY_BG
+        self.copy_btn_disabled_bg = DISABLED_BG
+        self.copy_btn_text = TEXT
+        self.copy_btn_muted = MUTED
 
     # ── Helpers ──────────────────────────────
     def _open_file(self, var, filetypes):
@@ -440,17 +513,76 @@ class App(tk.Tk):
         if path:
             var.set(path)
 
-    def _copy_chrome_cmd(self):
-        cmd = 'chrome.exe --remote-debugging-port=9222 --user-data-dir="%USERPROFILE%\\ChromeDebug"'
-        self.clipboard_clear()
-        self.clipboard_append(cmd)
-        messagebox.showinfo("Copiado", "Comando copiado al portapapeles.\n\nEjecutalo en PowerShell o CMD antes de continuar.")
-
     def _log(self, msg):
         self.log_box.insert("end", msg + "\n")
         self.log_box.see("end")
         self.update_idletasks()
 
+
+    def _copy_title(self):
+        title_to_copy = ""
+
+        if self.last_metadata_path and os.path.exists(self.last_metadata_path):
+            try:
+                with open(self.last_metadata_path, "r", encoding="utf-8") as file:
+                    lines = [line.rstrip("\n") for line in file]
+                for index, line in enumerate(lines):
+                    if line.strip().upper() == "TITULO:":
+                        if index + 1 < len(lines):
+                            title_to_copy = lines[index + 1].strip()
+                        break
+            except Exception:
+                title_to_copy = ""
+
+        if not title_to_copy and self.last_metadata:
+            title_to_copy = self.last_metadata.get("title", "").strip()
+
+        if not title_to_copy:
+            messagebox.showwarning("Sin metadata", "Primero generá el video y la metadata.")
+            return
+
+        self.clipboard_clear()
+        self.clipboard_append(title_to_copy)
+        messagebox.showinfo("Copiado", "Título copiado al portapapeles.")
+
+    def _copy_description(self):
+        if not self.last_metadata:
+            messagebox.showwarning("Sin metadata", "Primero generá el video y la metadata.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(self.last_metadata.get("description", ""))
+        messagebox.showinfo("Copiado", "Descripción copiada al portapapeles.")
+
+    def _set_metadata_buttons(self, enabled: bool):
+        state = "normal" if enabled else "disabled"
+        self.btn_copy_title.config(state=state)
+        self.btn_copy_description.config(state=state)
+        if enabled:
+            self.btn_copy_title.config(
+                bg=self.copy_btn_ready_bg,
+                activebackground=self.copy_btn_ready_bg,
+                fg="white",
+                text="✅ Copiar título"
+            )
+            self.btn_copy_description.config(
+                bg=self.copy_btn_ready_bg,
+                activebackground=self.copy_btn_ready_bg,
+                fg="white",
+                text="✅ Copiar descripción"
+            )
+        else:
+            self.btn_copy_title.config(
+                bg=self.copy_btn_disabled_bg,
+                activebackground=self.copy_btn_default_bg,
+                fg=self.copy_btn_muted,
+                text="📋 Copiar título"
+            )
+            self.btn_copy_description.config(
+                bg=self.copy_btn_disabled_bg,
+                activebackground=self.copy_btn_default_bg,
+                fg=self.copy_btn_muted,
+                text="📋 Copiar descripción"
+            )
     def _set_progress(self, value, text=""):
         self.progress_var.set(value)
         if text:
@@ -460,7 +592,6 @@ class App(tk.Tk):
     def _set_buttons(self, enabled: bool):
         state = "normal" if enabled else "disabled"
         self.btn_only_video.config(state=state)
-        self.btn_full.config(state=state)
 
     # ── Validación ───────────────────────────
     def _validate(self) -> bool:
@@ -476,24 +607,33 @@ class App(tk.Tk):
         if not self.output_path.get():
             messagebox.showerror("Error", "Indicá dónde guardar el video.")
             return False
+        if not configure_tesseract():
+            messagebox.showerror("Tesseract no encontrado", tesseract_help_message())
+            return False
         return True
 
     # ── Proceso principal ─────────────────────
-    def _start(self, upload: bool):
+    def _start(self):
         if not self._validate():
             return
+
+        self.last_metadata = None
+        self.last_metadata_path = ""
+        self._set_metadata_buttons(False)
         self._set_buttons(False)
         self._set_progress(0, "Iniciando...")
         self.log_box.delete("1.0", "end")
-        thread = threading.Thread(target=self._run, args=(upload,), daemon=True)
+        thread = threading.Thread(target=self._run, daemon=True)
         thread.start()
 
-    def _run(self, upload: bool):
+    def _run(self):
         processor = MusicVideoProcessor(
             progress_callback=self._set_progress,
             log_callback=self._log
         )
         try:
+            self._log(f"ℹ️ MoviePy detectado: {getattr(moviepy_module, '__version__', 'desconocido')}")
+
             # 1. OCR
             self._set_progress(10, "Leyendo texto de fotos (OCR)...")
             self._log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -508,6 +648,10 @@ class App(tk.Tk):
             self._log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             self._log("PASO 2: Generando metadata")
             metadata = processor.generate_description(text1, text2)
+
+            self._log("PASO 2.5: Corrigiendo metadata con IA...")
+            metadata = processor.improve_metadata_with_ai(metadata)
+
             self._log(f"📌 Título: {metadata['title']}")
             self._log(f"🏷️  Tags: {', '.join(metadata['tags'][:8])}")
             self._set_progress(25, "Metadata lista.")
@@ -522,19 +666,20 @@ class App(tk.Tk):
                 self.output_path.get()
             )
 
-            # 4. Upload
-            if upload:
-                self._log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                self._log("PASO 4: Subiendo a YouTube")
-                processor.upload_to_youtube(self.output_path.get(), metadata)
-            else:
-                self._set_progress(100, "✅ Video generado correctamente.")
-                self._log("✅ Video generado. No se subió a YouTube.")
+            self._log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            self._log("PASO 4: Guardando metadata")
+            metadata_path = processor.save_metadata_file(self.output_path.get(), metadata)
+            self.last_metadata = metadata
+            self.last_metadata_path = metadata_path
+            self._set_metadata_buttons(True)
+            self._set_progress(100, "✅ Video y metadata generados correctamente.")
+            self._log("✅ Proceso completado. Listo para subir manualmente.")
 
             messagebox.showinfo(
                 "¡Éxito!",
-                f"{'Video generado y subido a YouTube 🎉' if upload else 'Video generado correctamente 🎬'}\n\n"
-                f"Archivo: {self.output_path.get()}"
+                "Video y metadata generados correctamente 🎬\n\n"
+                f"Video: {self.output_path.get()}\n"
+                f"Metadata: {metadata_path}"
             )
 
         except Exception as e:
