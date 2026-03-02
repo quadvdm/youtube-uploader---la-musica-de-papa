@@ -29,6 +29,9 @@ REQUIRED_PACKAGES = [
 ]
 
 def install_if_missing():
+    if getattr(sys, "frozen", False):
+        return
+
     import importlib
     missing = []
     for pkg_name, import_name in REQUIRED_PACKAGES:
@@ -38,8 +41,16 @@ def install_if_missing():
             missing.append(pkg_name)
     if missing:
         print(f"Instalando paquetes faltantes: {missing}")
-        subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing, 
-                              stdout=subprocess.DEVNULL)
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install"] + missing,
+                stdout=subprocess.DEVNULL
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                "No se pudieron instalar dependencias automáticamente. "
+                "Instalalas manualmente con pip e intentá de nuevo."
+            ) from exc
 
 install_if_missing()
 

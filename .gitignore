@@ -1,0 +1,14 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+
+# PyInstaller artifacts
+build/
+dist/
+*.spec.bak
+
+# Local debug build spec
+youtube_uploader_debug.spec
